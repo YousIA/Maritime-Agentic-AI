@@ -1,0 +1,73 @@
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Any, Tuple
+import numpy as np
+
+
+@dataclass
+class Detection:
+    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2)
+    class_id: int
+    class_name: str
+    confidence: float                        
+    visual_features: Optional[np.ndarray] = None 
+
+
+@dataclass
+class AISInfo:
+    mmsi: str
+    lat: float
+    lon: float
+    sog: float          
+    cog: float          
+    ship_type: Optional[str] = None
+
+
+@dataclass
+class EnvironmentalInfo:
+    wind_speed: float = 0.0
+    wave_height: float = 0.0
+    visibility: float = 10.0  
+    temperature: float = 15.0
+
+
+@dataclass
+class MaritimeState:
+    image: Optional[np.ndarray] = None
+    ais_messages: List[AISInfo] = field(default_factory=list)
+    radar_points: Optional[np.ndarray] = None
+    environment: EnvironmentalInfo = field(default_factory=EnvironmentalInfo)
+    knowledge: Dict[str, Any] = field(default_factory=dict)
+    history: List[Any] = field(default_factory=list)
+    goal: str = "monitor"
+
+
+@dataclass
+class ContextualRepresentation:
+    detection: Detection
+    ais_match: Optional[AISInfo] = None
+    environmental_context: Optional[EnvironmentalInfo] = None
+    historical_context: Optional[Any] = None
+    knowledge_context: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class AgentConfig:
+    tau_1: float = 0.3   
+    tau_2: float = 0.6   
+
+    alpha: float = 0.5   
+    beta: float = 0.3    
+    delta: float = 0.2   
+
+    cost_per_model_call: float = 1.0
+    cost_per_ais_query: float = 0.2
+
+    qwen_model_id: str = "Qwen/Qwen2-VL-2B-Instruct"
+    qwen_max_new_tokens: int = 256
+    use_4bit: bool = True
+
+    mmdec_image_dir: str = "./data/MMDEC/Dataset_S1_chunks"
+    mmdec_ais_path: str = "./data/MMDEC/Dataset_AIS_POS.parquet"
+    mmdec_sat_outputs_dir: str = "./data/MMDEC/Dataset_S1_SatShipAI_outputs"
+
+    ais_match_tolerance_deg: float = 0.01
