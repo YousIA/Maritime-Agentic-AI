@@ -1,0 +1,68 @@
+import numpy as np
+import pandas as pd
+from typing import List, Optional, Tuple
+from config import (
+    Detection, AISInfo, EnvironmentalInfo,
+    MaritimeState, ContextualRepresentation, AgentConfig
+)
+
+
+class MaritimeDetector:
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+
+    def detect(self, image: np.ndarray) -> List[Detection]:
+    results = self.model.predict(image, conf=0.1, verbose=False)
+    detections = []
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cls = int(box.cls[0])
+            detections.append(Detection(
+                bbox=(x1, y1, x2, y2),
+                class_id=cls,
+                class_name=self.names[cls],
+                confidence=float(box.conf[0]),
+            ))
+    return detections
+
+class ContextBuilder:
+
+    def __init__(self, config: AgentConfig, ais_df: Optional[pd.DataFrame] = None):
+        self.config = config
+        self.ais_df = ais_df  
+
+    def build(
+        self,
+        detections: List[Detection],
+        state: MaritimeState,
+    ) -> List[ContextualRepresentation]:
+        contexts = []
+        for det in detections:
+            ais_match = self._match_ais(det, state)
+            ctx = ContextualRepresentation(
+                detection=det,
+                ais_match=ais_match,
+                environmental_context=state.environment,
+                historical_context=state.history[-1] if state.history else None,
+                knowledge_context=state.knowledge,
+            )
+            contexts.append(ctx)
+        return contexts
+
+    def _match_ais(
+        self, det: Detection, state: MaritimeState
+    ) -> Optional[AISInfo]:
+        if not state.ais_messages:
+            return None
+        return state.ais_messages[0] if state.ais_messages else None
+
+
+def load_mmdec_ais(config: AgentConfig) -> Optional[pd.DataFrame]:
+    try:
+        df = pd.read_parquet(config.mmdec_ais_path)
+        return df
+    except Exception as e:
+        print(f"[ContextBuilder] Could not load AIS data: {e}")
+        return None
