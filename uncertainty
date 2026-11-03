@@ -1,0 +1,83 @@
+import numpy as np
+from typing import List, Optional, Dict, Any
+from enum import Enum
+
+from config import (
+    ContextualRepresentation, Detection, AISInfo,
+    AgentConfig
+)
+
+
+class Action(Enum):
+    ACCEPT = "Accept"
+    VERIFY = "Verify"
+    ACQUIRE = "Acquire additional information"
+
+
+class UncertaintyEstimator:
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+
+    def compute(
+        self,
+        ctx: ContextualRepresentation,
+        modal_disagreement: float = 0.0,
+    ) -> float:
+        p_i = ctx.detection.confidence
+
+        u_context = self._contextual_inconsistency(ctx)
+
+        u_i = (
+            self.config.alpha * (1.0 - p_i)
+            + self.config.beta * modal_disagreement
+            + self.config.delta * u_context
+        )
+        return float(np.clip(u_i, 0.0, 1.0))
+
+    def _contextual_inconsistency(self, ctx: ContextualRepresentation) -> float:
+        det = ctx.detection
+        ais = ctx.ais_match
+
+        if ais is None:
+            return 0.5
+
+        inconsistency = 0.0
+        if det.class_name.lower() in ("vessel", "ship") and ais.ship_type is None:
+            inconsistency = 0.3
+        return float(inconsistency)
+
+    def select_action(self, u_i: float) -> Action:
+        if u_i < self.config.tau_1:
+            return Action.ACCEPT
+        elif u_i < self.config.tau_2:
+            return Action.VERIFY
+        else:
+            return Action.ACQUIRE
+
+class EVICalculator:
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+
+    def compute(
+        self,
+        current_utility: float,
+        expected_utility_with_info: float,
+        info_source: str,
+    ) -> float:
+        cost = self._cost(info_source)
+        evi = expected_utility_with_info - current_utility - cost
+        return evi
+
+    def _cost(self, source: str) -> float:
+        costs = {
+            "qwen_verify": self.config.cost_per_model_call,
+            "ais_query": self.config.cost_per_ais_query,
+            "radar": 0.3,
+            "weather": 0.1,
+        }
+        return costs.get(source, 0.5)
+
+    def should_invoke(self, evi: float) -> bool:
+        return evi > 0.0
