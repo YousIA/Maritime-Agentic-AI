@@ -1,0 +1,259 @@
+import torch
+import numpy as np
+from PIL import Image
+from typing import List, Optional, Dict, Any
+
+from transformers import (
+    Qwen2VLForConditionalGeneration,
+    AutoProcessor,
+    BitsAndBytesConfig,
+)
+
+from config import (
+    AgentConfig, MaritimeState, Detection,
+    ContextualRepresentation,
+)
+from perception import MaritimeDetector, ContextBuilder, load_mmdec_ais
+from uncertainty import (
+    UncertaintyEstimator, EVICalculator, Action,
+)
+
+
+class QwenVerifier:
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.model = None
+        self.processor = None
+
+    def load(self):
+        if self.model is not None:
+            return
+
+        print("[QwenVerifier] Loading Qwen2-VL...")
+        bnb_config = None
+        if self.config.use_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.bfloat16,
+            )
+
+        self.model = Qwen2VLForConditionalGeneration.from_pretrained(
+            self.config.qwen_model_id,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            quantization_config=bnb_config,
+            trust_remote_code=True,
+        )
+        self.processor = AutoProcessor.from_pretrained(
+            self.config.qwen_model_id,
+            trust_remote_code=True,
+        )
+        print("[QwenVerifier] Model loaded.")
+
+    def verify(
+        self,
+        image: np.ndarray,
+        ctx: ContextualRepresentation,
+        context_summary: str,
+    ) -> Dict[str, Any]:
+        self.load()
+
+        pil_image = Image.fromarray(image)
+        det = ctx.detection
+
+        prompt = (
+            f"You are a maritime situation reasoning component.\n"
+            f"A visual detector identified a '{det.class_name}' with confidence "
+            f"{det.confidence:.2f} at bounding box {det.bbox}.\n"
+            f"Context: {context_summary}\n\n"
+            f"Please assess: (1) Does this detection appear to be a real vessel? "
+            f"(2) Are there any contextual inconsistencies? "
+            f"(3) What is your confidence in this detection being a genuine maritime object? "
+            f"Answer concisely."
+        )
+
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": pil_image},
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        ]
+
+        text = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = self.processor(
+            text=[text], images=[pil_image], return_tensors="pt"
+        ).to(self.model.device)
+
+        with torch.no_grad():
+            output_ids = self.model.generate(
+                **inputs,
+                max_new_tokens=self.config.qwen_max_new_tokens,
+            )
+
+        response = self.processor.decode(
+            output_ids[0], skip_special_tokens=True
+        )
+
+        interpretation = response.split("assistant")[-1].strip()
+
+        return {
+            "raw_response": interpretation,
+            "semantic_confidence": self._estimate_confidence(interpretation),
+        }
+
+    def _estimate_confidence(self, text: str) -> float:
+        text_lower = text.lower()
+        if "high confidence" in text_lower or "likely real" in text_lower:
+            return 0.9
+        if "low confidence" in text_lower or "likely false" in text_lower:
+            return 0.2
+        if "inconsisten" in text_lower or "suspicious" in text_lower:
+            return 0.4
+        return 0.6  
+
+
+class MaritimeCoordinatorAgent:
+
+    def __init__(self, config: AgentConfig):
+        self.config = config
+        self.detector = MaritimeDetector(config)
+        self.context_builder = ContextBuilder(
+            config, ais_df=load_mmdec_ais(config)
+        )
+        self.uncertainty = UncertaintyEstimator(config)
+        self.evi = EVICalculator(config)
+        self.qwen = QwenVerifier(config)
+
+    def step(self, state: MaritimeState) -> Dict[str, Any]:
+        results = {
+            "detections": [],
+            "actions": [],
+            "interpretations": [],
+        }
+
+        if state.image is None:
+            return results
+
+        # 1. Perception
+        detections = self.detector.detect(state.image)
+        results["detections"] = detections
+
+        # 2. Contextualization
+        contexts = self.context_builder.build(detections, state)
+
+        # 3. Assess uncertainty and decide
+        for ctx in contexts:
+            u_i = self.uncertainty.compute(ctx, modal_disagreement=0.0)
+            action = self.uncertainty.select_action(u_i)
+
+            result_entry = {
+                "detection": ctx.detection,
+                "uncertainty": u_i,
+                "action": action.value,
+            }
+
+            # 4. Action execution
+            if action == Action.ACCEPT:
+                result_entry["final_confidence"] = ctx.detection.confidence
+
+            elif action == Action.VERIFY:
+                context_summary = self._summarize_context(ctx, state)
+                q_result = self.qwen.verify(
+                    state.image, ctx, context_summary
+                )
+                result_entry["qwen_interpretation"] = q_result
+                result_entry["final_confidence"] = q_result.get(
+                    "semantic_confidence", ctx.detection.confidence
+                )
+
+            elif action == Action.ACQUIRE:
+                current_utility = ctx.detection.confidence
+                q_result = self.qwen.verify(
+                    state.image, ctx, self._summarize_context(ctx, state)
+                )
+                expected_utility = q_result.get(
+                    "semantic_confidence", current_utility
+                )
+                evi = self.evi.compute(
+                    current_utility, expected_utility, "qwen_verify"
+                )
+
+                if self.evi.should_invoke(evi):
+                    result_entry["qwen_interpretation"] = q_result
+                    result_entry["evi"] = evi
+                    result_entry["final_confidence"] = expected_utility
+                else:
+                    result_entry["final_confidence"] = current_utility
+
+            results["actions"].append(result_entry)
+
+        return results
+
+    def _summarize_context(
+        self, ctx: ContextualRepresentation, state: MaritimeState
+    ) -> str:
+        parts = []
+        if ctx.ais_match:
+            parts.append(
+                f"AIS reports vessel MMSI {ctx.ais_match.mmsi} "
+                f"at speed {ctx.ais_match.sog} kn, course {ctx.ais_match.cog}°."
+            )
+        else:
+            parts.append("No AIS vessel found in the vicinity.")
+        if ctx.environmental_context:
+            env = ctx.environmental_context
+            parts.append(
+                f"Weather: wind {env.wind_speed} m/s, wave {env.wave_height} m."
+            )
+        return " ".join(parts)
+
+def demo():
+    config = AgentConfig()
+    agent = MaritimeCoordinatorAgent(config)
+    image = np.random.randint(0, 255, (800, 800, 3), dtype=np.uint8)
+
+    from config import AISInfo
+    ais_msg = AISInfo(
+        mmsi="123456789",
+        lat=49.5,
+        lon=-1.5,
+        sog=12.0,
+        cog=180.0,
+        ship_type="Cargo",
+    )
+
+    state = MaritimeState(
+        image=image,
+        ais_messages=[ais_msg],
+        environment=EnvironmentalInfo(
+            wind_speed=8.0, wave_height=1.5, visibility=8.0
+        ),
+        goal="monitor",
+    )
+
+    results = agent.step(state)
+
+    print("\n=== Agent Step Results ===")
+    for i, r in enumerate(results["actions"]):
+        print(f"\nDetection {i+1}:")
+        print(f"  BBox: {r['detection'].bbox}")
+        print(f"  Detector confidence: {r['detection'].confidence:.2f}")
+        print(f"  Uncertainty U_i: {r['uncertainty']:.3f}")
+        print(f"  Action: {r['action']}")
+        if "qwen_interpretation" in r:
+            print(f"  Qwen verification: {r['qwen_interpretation']['raw_response'][:200]}...")
+            print(f"  Semantic confidence: {r['qwen_interpretation']['semantic_confidence']:.2f}")
+        if "evi" in r:
+            print(f"  EVI: {r['evi']:.3f}")
+        print(f"  Final confidence: {r['final_confidence']:.2f}")
+
+
+if __name__ == "__main__":
+    demo()
